@@ -24,6 +24,8 @@ DOWNLOAD_DIR  = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ================= إعدادات عامة =================
+SHAREPOINT_DRIVE_ID = "b!SW3p4WdqFkSGfzCxKIfYMaS0oVIopQlKiu57F-BNFmUEKDwH88KHTJiDNvOE1wap"
+
 HEADLESS_BROWSER = False
 URL          = "https://esupply.dubai.gov.ae/esupply/web/index.html"
 WAIT         = 25
@@ -78,18 +80,9 @@ def open_results_page(driver: webdriver.Chrome, page: int = 1) -> None:
         EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Search now!')]"))
     ).click()
 
-    # اضغط على تبويب Past Opportunities
-    try:
-        past_tab = WebDriverWait(driver, WAIT).until(
-            EC.element_to_be_clickable((By.XPATH, "//div[contains(@class,'Tab-base') and .//span[text()='Past Opportunities'] and contains(@onclick,'past/list.si') ]"))
-        )
-        driver.execute_script("arguments[0].click();", past_tab)
-        # انتظر حتى تظهر النتائج
-        WebDriverWait(driver, WAIT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "a.detailLink"))
-        )
-    except Exception:
-        print("⚠️ لم يتم العثور على تبويب Past Opportunities أو لم يتم الضغط عليه.")
+    WebDriverWait(driver, WAIT).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "a.detailLink"))
+    )
 
     # اضغط على رأس عمود Publication Date بعد ظهور النتائج
     try:
@@ -276,8 +269,8 @@ def extract_detail_data(driver: webdriver.Chrome) -> Dict:
         file_name_encoded = requests.utils.quote(file_name)
         # استخدم اسم الملف كما هو بدون إضافة extension مرة أخرى
         upload_url = (
-            f"https://graph.microsoft.com/v1.0/drives/b!tTBPC_-czEqXfkJlctO4vGqZyw9Xn4JJowY-M42VuNpv_VU8ao7gRZxmtOD7507w"
-            f"/root:/Documents/Etimad/esupply/{tender_folder}/{file_name_encoded}:/content"
+            f"https://graph.microsoft.com/v1.0/drives/{SHAREPOINT_DRIVE_ID}"
+            f"/root:/Tenders/esupply/{tender_folder}/{file_name_encoded}:/content"
         )
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -285,8 +278,8 @@ def extract_detail_data(driver: webdriver.Chrome) -> Dict:
         }
         # تحقق هل الملف موجود بالفعل على الأوندرايف بنفس الاسم
         check_url = (
-            f"https://graph.microsoft.com/v1.0/drives/b!tTBPC_-czEqXfkJlctO4vGqZyw9Xn4JJowY-M42VuNpv_VU8ao7gRZxmtOD7507w"
-            f"/root:/Documents/Etimad/esupply/{tender_folder}/{file_name_encoded}"
+            f"https://graph.microsoft.com/v1.0/drives/{SHAREPOINT_DRIVE_ID}"
+            f"/root:/Tenders/esupply/{tender_folder}/{file_name_encoded}"
         )
         check_headers = {
             "Authorization": f"Bearer {access_token}",
@@ -374,10 +367,8 @@ def extract_detail_data(driver: webdriver.Chrome) -> Dict:
 # ================= البرنامج الرئيسي =================
 
 def main():
-
     page, start = load_resume()
     drv = setup_driver()
-    tenders_batch = []
     try:
         open_results_page(drv, page)
 
@@ -398,20 +389,24 @@ def main():
                     drv.get(urls[idx])
                     WebDriverWait(drv, WAIT).until(EC.presence_of_element_located((By.ID, "opportunityDetailFEBean")))
                     tender = extract_detail_data(drv)
-                    tenders_batch.append(tender)
                     save_resume(page, idx+1)
+                    try:
+                        response = requests.post(API_ENDPOINT, headers=HEADERS, json=tender, timeout=30)
+                        # حذف ملف PDF بعد نجاح الاستجابة من الـ API
+                        if response.status_code == 200 and 'project_code' in tender:
+                            pdf_path = os.path.join(DOWNLOAD_DIR, f"{tender['project_code']}.pdf")
+                            if os.path.exists(pdf_path):
+                                try:
+                                    os.remove(pdf_path)
+                                    print(f"Deleted file: {pdf_path}")
+                                except Exception as e:
+                                    print(f"Failed to delete file {pdf_path}: {e}")
+                    except Exception as rr:
+                        print("API", rr)
                 except Exception as ee:
                     print("⚠️", ee)
                     drv.quit(); drv = setup_driver(); open_results_page(drv, page)
                     continue
-            # أرسل دفعة التندرات بعد كل صفحة
-            if tenders_batch:
-                try:
-                    resp = requests.post(API_ENDPOINT + "_bulk", headers=HEADERS, json={"tenders": tenders_batch}, timeout=120)
-                    print("API bulk response:", resp.text)
-                except Exception as rr:
-                    print("API bulk error", rr)
-                tenders_batch = []
             if page == 4:
                 print("✅ تم إنهاء الصفحة الرابعة. سيتم إعادة resume.txt إلى 1,0 والخروج.")
                 save_resume(1, 0)
