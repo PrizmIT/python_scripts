@@ -23,6 +23,8 @@ import sys
 # Get the root directory of the script
 SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+SHAREPOINT_DRIVE_ID = "b!SW3p4WdqFkSGfzCxKIfYMaS0oVIopQlKiu57F-BNFmUEKDwH88KHTJiDNvOE1wap"
+
 class Tee:
     def __init__(self, *streams):
         self.streams = streams
@@ -59,6 +61,21 @@ sys.stderr = Tee(sys.stderr, log_file)
 
 #api_base_url = "http://localhost/offline_prizm_321/api/tenders/"
 api_base_url = "https://ms.prizm-energy.com/MS/api/tenders/"
+
+# when we upload files we also record them in the tender_drive tables
+DRIVE_SAVE_ENDPOINT = "http://localhost/prizm331/api/tenders/save_drive_data"
+# this crawler always uses the Drydocks source
+SOURCE = "Drydocks"
+
+
+def remove_file_if_exists(file_path):
+    """Remove a file if it exists, and print a message."""
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            print(f"🗑️ Temporary file deleted: {file_path}")
+        except Exception as e:
+            print(f"Failed to delete file {file_path}: {e}")
 
 
 def get_graph_access_token():
@@ -798,16 +815,30 @@ def send_data_to_api(api_url, data):
                     
                    
                     
-                    result=upload_to_onedrive(latest_file_path, file_name, get_graph_access_token())
-                    
-                        
-                        
-                    if result:
+                    result = upload_to_onedrive(latest_file_path, file_name, get_graph_access_token())
+                    # حذف ملف PDF بعد نجاح الإرسال
+                    remove_file_if_exists(latest_file_path)
+                    if result and result.get('success'):
                         print("✅ File Result")
                         print(result)
                         print("✅ File uploaded to OneDrive successfully!")
+                        # also save drive metadata locally
+                        file_id = result.get('info', {}).get('id')
+                        # try to extract the parent folder's Graph ID
+                        folder_graph_id = result.get('info', {}).get('parentReference', {}).get('id')
+                        payload = {
+                            'source': SOURCE,
+                            'tender_number': file_name,
+                            'drive_id': folder_graph_id or api_id,
+                            'files': [{'id': file_id, 'name': file_name}]
+                        }
+                        print('drive payload', payload)
+                        try:
+                            r = requests.post(DRIVE_SAVE_ENDPOINT, json=payload)
+                            print('drive save', r.status_code, r.text)
+                        except Exception as e:
+                            print('drive save error', e)
                         return True
-                    
                     else:
                         return False
                 else:
@@ -1069,7 +1100,7 @@ def upload_to_onedrive(file_path, file_name, access_token):
     extension = os.path.splitext(file_path)[1]
     print("extension = ",extension)
     # OneDrive upload URL (replace this with your actual path)
-    upload_url = f"https://graph.microsoft.com/v1.0/drives/b!tTBPC_-czEqXfkJlctO4vGqZyw9Xn4JJowY-M42VuNpv_VU8ao7gRZxmtOD7507w/root:/Documents/Etimad/DRYDOCKS/{file_name_encoded}/{file_name_encoded}{extension}:/content"
+    upload_url = f"https://graph.microsoft.com/v1.0/drives/{SHAREPOINT_DRIVE_ID}/root:/Tenders/Drydocks/{file_name_encoded}/{file_name_encoded}{extension}:/content"
     print(upload_url)
     # Read the file content
     try:
@@ -1087,7 +1118,12 @@ def upload_to_onedrive(file_path, file_name, access_token):
     try:
         response = requests.put(upload_url, headers=headers, data=file_content)
         if response.status_code in [200, 201]:
-            return {'success': True, 'message': 'File uploaded successfully to OneDrive.'}
+            info = {}
+            try:
+                info = response.json()
+            except Exception:
+                pass
+            return {'success': True, 'message': 'File uploaded successfully to OneDrive.', 'info': info}
         else:
             return {
                 'success': False,
@@ -1123,7 +1159,7 @@ else:
         password_input = wait.until(EC.visibility_of_element_located((By.NAME, "password")))
 
         username_input.send_keys("info@prizm-energy.com")
-        password_input.send_keys(".8E2Se]Lj~F4ky?B")
+        password_input.send_keys('gsTQQ3QJKY4!Mx2')
 
         login_button = wait.until(EC.element_to_be_clickable((By.ID, "btnActive")))
         login_button.click()
