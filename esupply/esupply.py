@@ -5,6 +5,52 @@ from typing import Tuple, List, Dict
 
 import requests, json
 from selenium import webdriver
+
+# === OneDrive helpers ===
+
+SHAREPOINT_DRIVE_ID = "b!SW3p4WdqFkSGfzCxKIfYMaS0oVIopQlKiu57F-BNFmUEKDwH88KHTJiDNvOE1wap"
+
+
+def ensure_onedrive_folder(access_token, tender_number, source="esupply"):
+    """Return OneDrive folder id for tender, creating it if necessary."""
+    if not access_token:
+        return None
+    drive_id = SHAREPOINT_DRIVE_ID
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    folder_path = f"Tenders/{source}/{tender_number}"
+    # try to fetch existing folder
+    meta_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{folder_path}"
+    r = requests.get(meta_url, headers=headers)
+    if r.status_code == 200:
+        try:
+            return r.json().get('id')
+        except Exception:
+            return None
+    parent_path = f"Tenders/{source}"
+    create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{parent_path}:/children"
+    body = {"name": tender_number, "folder": {}, "@microsoft.graph.conflictBehavior": "replace"}
+    r2 = requests.post(create_url, headers=headers, json=body)
+    if r2.status_code in (200, 201):
+        try:
+            return r2.json().get('id')
+        except Exception:
+            return None
+    print(f"❌ Could not ensure folder, status {r2.status_code}: {r2.text}")
+    return None
+
+
+def record_drive_data_to_php(tender_number, folder_id, files_info, source="esupply"):
+    url = "http://localhost/prizm331/api/tenders/save_drive_data"
+    payload = {"source": source, "tender_number": tender_number, "drive_id": folder_id, "files": files_info}
+    headers = {"Content-Type": "application/json"}
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        print(f"➡️ Drive data recorded, php status {r.status_code}, resp: {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ Failed to call PHP save_drive_data: {e}")
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
@@ -29,7 +75,7 @@ URL          = "https://esupply.dubai.gov.ae/esupply/web/index.html"
 WAIT         = 25
 DL_WAIT      = 3
 RESUME_FILE  = os.path.join(BASE_DIR, "resume.txt")
-API_ENDPOINT = "https://ms.prizm-energy.com/MS/api/tenders/insert_esupply"
+API_ENDPOINT = "http://localhost/prizm331/api/tenders/insert_esupply"
 HEADERS      = {
     "Accept": "application/json",
     "Content-Type": "application/json",
@@ -160,6 +206,25 @@ def collect_tender_urls(driver: webdriver.Chrome) -> List[str]:
         """
     )
 
+# =============== جمع كل روابط التندرات من جميع الصفحات دفعة واحدة ===============
+def collect_all_tender_urls(driver: webdriver.Chrome) -> List[str]:
+    all_urls = []
+    page = 1
+    open_results_page(driver, page)
+    seen = set()
+    while True:
+        urls = collect_tender_urls(driver)
+        # أضف فقط الروابط الجديدة
+        new_urls = [u for u in urls if u not in seen]
+        all_urls.extend(new_urls)
+        seen.update(new_urls)
+        if not click_next_page(driver):
+            break
+        page += 1
+        # انتظر حتى تتغير الصفحة
+        time.sleep(1)
+    return all_urls
+
 # ================= تنزيل PDF =================
 
 def wait_new_file(before: set, timeout: int = 20) -> str | None:
@@ -259,49 +324,13 @@ def extract_detail_data(driver: webdriver.Chrome) -> Dict:
     except Exception:
         pass
 
-    # رفع ملفات التندر إلى الأوندرايف في مجلد باسم التندر داخل esupply
-    def upload_file_to_esupply_onedrive(file_path, tender_number, access_token):
-        import requests
-        file_name = os.path.basename(file_path)
-        tender_folder = requests.utils.quote(tender_number)
-        file_name_encoded = requests.utils.quote(file_name)
-        # استخدم اسم الملف كما هو بدون إضافة extension مرة أخرى
-        upload_url = (
-            f"https://graph.microsoft.com/v1.0/drives/b!tTBPC_-czEqXfkJlctO4vGqZyw9Xn4JJowY-M42VuNpv_VU8ao7gRZxmtOD7507w"
-            f"/root:/Documents/Etimad/esupply/{tender_folder}/{file_name_encoded}:/content"
-        )
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/octet-stream",
-        }
-        # تحقق هل الملف موجود بالفعل على الأوندرايف بنفس الاسم
-        check_url = (
-            f"https://graph.microsoft.com/v1.0/drives/b!tTBPC_-czEqXfkJlctO4vGqZyw9Xn4JJowY-M42VuNpv_VU8ao7gRZxmtOD7507w"
-            f"/root:/Documents/Etimad/esupply/{tender_folder}/{file_name_encoded}"
-        )
-        check_headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json"
-        }
-        check_resp = requests.get(check_url, headers=check_headers)
-        if check_resp.status_code == 200:
-            print(f"⚠️ الملف {file_name} موجود بالفعل على الأوندرايف، لن يتم رفعه مرة أخرى.")
-            return False
-        with open(file_path, "rb") as f:
-            file_content = f.read()
-        response = requests.put(upload_url, headers=headers, data=file_content)
-        if response.status_code in [200, 201]:
-            print(f"✅ Uploaded {file_name} to {tender_number} folder.")
-            return True
-        else:
-            print(f"❌ Failed to upload {file_name}: {response.text}")
-            return False
-
     def get_graph_access_token():
-      
-        headers = {"Accept":"application/json","Content-Type":"application/json","User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/140.0.0.0 Safari/537.36"}
+        api_url = "http://localhost/prizm331/api/tenders/get_token"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
         try:
             response = requests.get(api_url, headers=headers)
             if response.status_code == 200:
@@ -316,17 +345,64 @@ def extract_detail_data(driver: webdriver.Chrome) -> Dict:
                 print(f"❌ HTTP error: {response.status_code}")
         except Exception as e:
             print(f"⚠️ Request failed: {e}")
-        return None
+        return None    
 
+    # رفع ملفات التندر إلى الأوندرايف في مجلد باسم التندر داخل esupply
+    def upload_file_to_esupply_onedrive(file_path, tender_number, access_token):
+        import requests
+        file_name = os.path.basename(file_path)
+        tender_folder = requests.utils.quote(tender_number)
+        file_name_encoded = requests.utils.quote(file_name)
+        upload_url = (
+            f"https://graph.microsoft.com/v1.0/drives/{SHAREPOINT_DRIVE_ID}"
+            f"/root:/Tenders/esupply/{tender_folder}/{file_name_encoded}:/content"
+        )
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/octet-stream",
+        }
+        check_url = (
+            f"https://graph.microsoft.com/v1.0/drives/{SHAREPOINT_DRIVE_ID}"
+            f"/root:/Tenders/esupply/{tender_folder}/{file_name_encoded}"
+        )
+        check_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+        check_resp = requests.get(check_url, headers=check_headers)
+        if check_resp.status_code == 200:
+            print(f"⚠️ الملف {file_name} موجود بالفعل على الأوندرايف، لن يتم رفعه مرة أخرى.")
+            return {'success': False, 'error': 'already_exists'}
+        with open(file_path, "rb") as f:
+            file_content = f.read()
+        response = requests.put(upload_url, headers=headers, data=file_content)
+        if response.status_code in [200, 201]:
+            print(f"✅ Uploaded {file_name} to {tender_number} folder.")
+            try:
+                info = response.json()
+                fid = info.get('id')
+            except Exception:
+                fid = None
+            return {'success': True, 'id': fid, 'name': file_name}
+        else:
+            print(f"❌ Failed to upload {file_name}: {response.text}")
+            return {'success': False, 'error': response.text}
+
+    files_info = []
     try:
         access_token = get_graph_access_token()
         if not access_token:
             print("❌ لم يتم جلب access token من الـ API، لن يتم رفع الملفات.")
         else:
+            folder_id = ensure_onedrive_folder(access_token, code, source="esupply")
             for fname in os.listdir(DOWNLOAD_DIR):
                 if fname.startswith(code) and fname.lower().endswith('.pdf'):
                     fpath = os.path.join(DOWNLOAD_DIR, fname)
-                    upload_file_to_esupply_onedrive(fpath, code, access_token)
+                    res = upload_file_to_esupply_onedrive(fpath, code, access_token)
+                    if res.get('success'):
+                        files_info.append({'id': res.get('id'), 'name': fname})
+            if folder_id and files_info:
+                record_drive_data_to_php(code, folder_id, files_info, source="esupply")
     except Exception as e:
         print(f"❌ رفع ملفات التندر إلى الأوندرايف فشل: {e}")
 
@@ -362,56 +438,36 @@ def extract_detail_data(driver: webdriver.Chrome) -> Dict:
 
 # ================= البرنامج الرئيسي =================
 
+
 def main():
-
-    page, start = load_resume()
     drv = setup_driver()
-    tenders_batch = []
     try:
-        open_results_page(drv, page)
-
-        while True:
-            urls = collect_tender_urls(drv)
-            # إذا لم يوجد تندرات في الصفحة أو start أكبر من عددها، انتقل للصفحة التالية حتى تجد صفحة بها تندرات أو تنتهي الصفحات
-            while start >= len(urls):
-                if not click_next_page(drv):
-                    print("انتهت جميع الصفحات. لا يوجد المزيد.")
-                    break
-                page += 1
-                save_resume(page, 0)
-                start = 0
-                urls = collect_tender_urls(drv)
-
-            for idx in range(start, len(urls)):
+        print("⏳ جاري جمع جميع روابط التندرات من كل الصفحات...")
+        all_urls = collect_all_tender_urls(drv)
+        print(f"✅ تم جمع {len(all_urls)} رابط تندر.")
+        for idx, url in enumerate(all_urls):
+            try:
+                drv.get(url)
+                WebDriverWait(drv, WAIT).until(EC.presence_of_element_located((By.ID, "opportunityDetailFEBean")))
+                tender = extract_detail_data(drv)
+                save_resume(1, idx+1)
                 try:
-                    drv.get(urls[idx])
-                    WebDriverWait(drv, WAIT).until(EC.presence_of_element_located((By.ID, "opportunityDetailFEBean")))
-                    tender = extract_detail_data(drv)
-                    tenders_batch.append(tender)
-                    save_resume(page, idx+1)
-                except Exception as ee:
-                    print("⚠️", ee)
-                    drv.quit(); drv = setup_driver(); open_results_page(drv, page)
-                    continue
-            # أرسل دفعة التندرات بعد كل صفحة
-            if tenders_batch:
-                try:
-                    resp = requests.post(API_ENDPOINT, headers=HEADERS, json={"tenders": tenders_batch}, timeout=120)
-                    print("API bulk response:", resp.text)
+                    response = requests.post(API_ENDPOINT, headers=HEADERS, json=tender, timeout=30)
+                    # حذف ملف PDF بعد نجاح الاستجابة من الـ API
+                    if response.status_code == 200 and 'project_code' in tender:
+                        pdf_path = os.path.join(DOWNLOAD_DIR, f"{tender['project_code']}.pdf")
+                        if os.path.exists(pdf_path):
+                            try:
+                                os.remove(pdf_path)
+                                print(f"Deleted file: {pdf_path}")
+                            except Exception as e:
+                                print(f"Failed to delete file {pdf_path}: {e}")
                 except Exception as rr:
-                    print("API bulk error", rr)
-                tenders_batch = []
-            if page == 4:
-                print("✅ تم إنهاء الصفحة الرابعة. سيتم إعادة resume.txt إلى 1,0 والخروج.")
-                save_resume(1, 0)
-                drv.quit()
-                sys.exit(0)
-            start = 0
-            if not click_next_page(drv):
-                print("انتهت جميع الصفحات. لا يوجد المزيد.")
-                break
-            page += 1
-            save_resume(page, 0)
+                    print("API", rr)
+            except Exception as ee:
+                print("⚠️", ee)
+                drv.quit(); drv = setup_driver(); open_results_page(drv, 1)
+                continue
     finally:
         drv.quit()
 
