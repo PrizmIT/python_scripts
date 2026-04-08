@@ -14,6 +14,7 @@ import csv
 import os
 import requests
 import re
+import json
 
 # === CONFIGURATION ===
 PORTAL_URL = "https://eservice.addigital.gov.ae/OA_HTML/AppsLogin"
@@ -36,6 +37,8 @@ API_TOKEN = "your_actual_api_token_here"  # Replace with real token
 API_TIMEOUT = 10  # seconds
 
 api_base_url = "https://ms.prizm-energy.com/MS/api/tenders/"
+
+SHAREPOINT_DRIVE_ID = "b!SW3p4WdqFkSGfzCxKIfYMaS0oVIopQlKiu57F-BNFmUEKDwH88KHTJiDNvOE1wap"
 
 
 def get_graph_access_token():
@@ -292,14 +295,25 @@ def download_tender_with_pagination(driver, tender_number, index, total_count):
 
         log_message(f"✅ Downloaded {downloaded_count} file(s).", tender_number, "completed")
         access_token = get_graph_access_token()
+        # ensure folder exists and get its id
+        folder_id = ensure_onedrive_folder(access_token, tender_number)
+        files_info = []
         for file in os.listdir(download_dir):
             file_path = os.path.join(download_dir, file)
             if os.path.isfile(file_path):
                 upload_result = upload_to_onedrive(tender_number, file_path, access_token)
                 if upload_result.get("success"):
                     log_message(f"☁️ Uploaded to OneDrive: {file}", tender_number, "uploaded")
+                    # collect for database recording
+                    files_info.append({
+                        "id": upload_result.get('id'),
+                        "name": file
+                    })
                 else:
                     log_message(f"❌ OneDrive Upload Failed: {upload_result.get('error')}", tender_number, "upload_error")
+        # after all uploads, send metadata to PHP
+        if folder_id and files_info:
+            record_drive_data_to_php(tender_number, folder_id, files_info)
         # اضغط على تابة Lines بعد رفع الملفات
         click_lines_tab(driver)
         process_lines_tab(driver, tender_number)
@@ -513,6 +527,62 @@ def process_tenders():
     log_message(f"📄 Found {len(tender_list)} tenders to process")
     return tender_list
 
+
+# === OneDrive helpers ===
+
+def ensure_onedrive_folder(access_token, tender_number, source="ADERP"):
+    """Make sure a folder exists for the tender and return its OneDrive id."""
+    if not access_token:
+        return None
+    drive_id = SHAREPOINT_DRIVE_ID
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    folder_path = f"Tenders/{source}/{tender_number}"
+    # try to fetch existing folder metadata
+    meta_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{folder_path}"
+    r = requests.get(meta_url, headers=headers)
+    if r.status_code == 200:
+        try:
+            return r.json().get('id')
+        except Exception:
+            return None
+    # not found -> create under parent
+    parent_path = f"Tenders/{source}"
+    create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{parent_path}:/children"
+    body = {
+        "name": tender_number,
+        "folder": {},
+        "@microsoft.graph.conflictBehavior": "replace"
+    }
+    r2 = requests.post(create_url, headers=headers, json=body)
+    if r2.status_code in (200, 201):
+        try:
+            return r2.json().get('id')
+        except Exception:
+            return None
+    log_message(f"❌ Could not ensure folder, status {r2.status_code}: {r2.text}")
+    return None
+
+
+def record_drive_data_to_php(tender_number, folder_id, files_info, source="ADERP"):
+    """Send folder/file metadata to the PHP endpoint so it can be stored."""
+    url = "https://ms.prizm-energy.com/MS/api/tenders/save_drive_data"
+    payload = {
+        "source": source,
+        "tender_number": tender_number,
+        "drive_id": folder_id,
+        "files": files_info
+    }
+    headers = {"Content-Type": "application/json"}
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        log_message(f"➡️ Drive data recorded, php status {r.status_code}, resp: {r.text[:200]}")
+    except Exception as e:
+        log_message(f"⚠️ Failed to call PHP save_drive_data: {e}")
+
+
 def upload_to_onedrive(tender_number, file_path, access_token):
     if not access_token:
         return {'success': False, 'error': 'Failed to obtain Microsoft Graph access token.'}
@@ -525,9 +595,9 @@ def upload_to_onedrive(tender_number, file_path, access_token):
         return {'success': False, 'error': f"Invalid file name: {file_name}"}
 
     file_name_encoded = requests.utils.quote(file_name)
-    folder_path = f"Documents/Etimad/ADERP/{tender_number}"
-   
-    check_url = f"https://graph.microsoft.com/v1.0/drives/b!tTBPC_-czEqXfkJlctO4vGqZyw9Xn4JJowY-M42VuNpv_VU8ao7gRZxmtOD7507w/root:/{folder_path}/{file_name_encoded}"
+    folder_path = f"Tenders/ADERP/{tender_number}"
+
+    check_url = f"https://graph.microsoft.com/v1.0/drives/{SHAREPOINT_DRIVE_ID}/root:/{folder_path}/{file_name_encoded}"
 
     # Check if the file exists
     headers = {
@@ -540,7 +610,7 @@ def upload_to_onedrive(tender_number, file_path, access_token):
         return {'success': False, 'error': f"File already exists: {file_name}"}
 
     # If not found, proceed with upload
-    upload_url = f"https://graph.microsoft.com/v1.0/drives/b!tTBPC_-czEqXfkJlctO4vGqZyw9Xn4JJowY-M42VuNpv_VU8ao7gRZxmtOD7507w/root:/{folder_path}/{file_name_encoded}:/content"
+    upload_url = f"https://graph.microsoft.com/v1.0/drives/{SHAREPOINT_DRIVE_ID}/root:/{folder_path}/{file_name_encoded}:/content"
 
     try:
         with open(file_path, 'rb') as file:
@@ -553,7 +623,18 @@ def upload_to_onedrive(tender_number, file_path, access_token):
     try:
         upload_response = requests.put(upload_url, headers=headers, data=file_content)
         if upload_response.status_code in [200, 201]:
-            return {'success': True, 'message': 'File uploaded successfully to OneDrive.'}
+            # capture id from response JSON if available
+            try:
+                info = upload_response.json()
+                file_id = info.get('id')
+            except Exception:
+                file_id = None
+            return {
+                'success': True,
+                'message': 'File uploaded successfully to OneDrive.',
+                'id': file_id,
+                'name': file_name
+            }
         else:
             return {
                 'success': False,
